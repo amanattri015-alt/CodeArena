@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Build output
+dist/
+dist-ssr/
+build/
+
+# Logs
+*.log
+
+# Archives
+*.zip
+
+# Editor files
+.vscode/
+.idea/
+.DS_Store
