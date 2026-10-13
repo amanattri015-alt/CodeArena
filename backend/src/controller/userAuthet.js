@@ -21,13 +21,15 @@ const register=async (req,res)=>{
             emailId:user.emailId,
             _id:user._id
         }
-    res.cookie("token", token, {
+   const cookieOptions = {
     httpOnly: true,
-    secure: true,
-    sameSite: "none",
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     maxAge: 60 * 60 * 1000,
     path: "/"
-});
+};
+
+res.cookie("token", token, cookieOptions);
     res.status(201).json({
             user:reply,
             message:"login successfully"
@@ -67,13 +69,15 @@ const login=async (req,res)=>{
         }
 
         const token=jwt.sign({_id:user._id,emailId:emailId,role:user.role},process.env.JWT_KEY,{expiresIn:60*60});
-        res.cookie("token", token, {
-        httpOnly: true,
-        secure: true,
-        sameSite: "none",
-        maxAge: 60 * 60 * 1000,
-        path: "/"
-});
+       const cookieOptions = {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
+    maxAge: 60 * 60 * 1000,
+    path: "/"
+};
+
+res.cookie("token", token, cookieOptions);
 
         res.status(200).json({
             user:reply,
@@ -131,13 +135,15 @@ const adminRegister=async (req,res)=>{
     req.body.role="admin";
     const user=await User.create(req.body);
     const token=jwt.sign({_id:user._id,emailId:emailId,role:"admin"},process.env.JWT_KEY,{expiresIn:60*60});
-    res.cookie("token", token, {
+  const cookieOptions = {
     httpOnly: true,
-    secure: true,
-    sameSite: "none",
+    secure: process.env.NODE_ENV === "production",
+    sameSite: process.env.NODE_ENV === "production" ? "none" : "lax",
     maxAge: 60 * 60 * 1000,
     path: "/"
-});
+};
+
+res.cookie("token", token, cookieOptions);
     res.status(201).send("user registered successfully");
 
     }
