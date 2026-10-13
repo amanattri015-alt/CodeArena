@@ -104,7 +104,12 @@ const logout=async(req,res)=>{
             );
         }
 
-        res.clearCookie("token");
+       res.clearCookie("token", {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    path: "/"
+});
 
         return res.status(200).send("Logout successfully");
 
@@ -126,7 +131,13 @@ const adminRegister=async (req,res)=>{
     req.body.role="admin";
     const user=await User.create(req.body);
     const token=jwt.sign({_id:user._id,emailId:emailId,role:"admin"},process.env.JWT_KEY,{expiresIn:60*60});
-    res.cookie("token",token,{httpOnly:true,sameSite:"lax",secure:process.env.NODE_ENV==="production",maxAge:60*60*1000});
+    res.cookie("token", token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "none",
+    maxAge: 60 * 60 * 1000,
+    path: "/"
+});
     res.status(201).send("user registered successfully");
 
     }
