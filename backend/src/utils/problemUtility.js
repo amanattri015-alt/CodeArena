@@ -1,12 +1,12 @@
 const axios = require("axios");
+const { createHash } = require("crypto");
+const redisClient = require("../config/redis");
 
 const JDOODLE_URL = "https://api.jdoodle.com/v1/execute";
+const CACHE_PREFIX = "codearena:jdoodle:exec:v3:";
+const BATCH_DRIVER_MARKER = "CODEARENA_BATCH_MODE: EOF_MARKER";
+const CASE_END_MARKER = "__CODEARENA_CASE_END__";
 
-/*
- * JDoodle's language field is an identifier, not a human-readable label.
- * versionIndex is the index accepted by JDoodle for that language.
- * Keep these values aligned with the languages enabled for your API account.
- */
 const LANGUAGE_MAP = {
     "c++": { language: "cpp23", versionIndex: "0" },
     java: { language: "java", versionIndex: "0" },
@@ -15,7 +15,6 @@ const LANGUAGE_MAP = {
 
 const normalizeLanguage = (lang) => {
     if (typeof lang !== "string") return "";
-
     const value = lang.trim().toLowerCase();
     if (["c++", "cpp", "c++23", "cpp23"].includes(value)) return "c++";
     if (["java", "java 17", "java 21"].includes(value)) return "java";
@@ -23,20 +22,14 @@ const normalizeLanguage = (lang) => {
     return value;
 };
 
-const getLanguageById = (lang) => {
-    const normalized = normalizeLanguage(lang);
-    return LANGUAGE_MAP[normalized] || null;
-};
+const getLanguageById = (lang) => LANGUAGE_MAP[normalizeLanguage(lang)] || null;
 
-/*
- * Finds `class Solution { ... }` while ignoring braces inside comments and
- * quoted strings. This lets a problem's full reference executable act as its
- * driver template, while replacing only the reference Solution class with a
- * user's class-based submission.
- */
+const hasBatchDriver = (source) =>
+    typeof source === "string" && source.includes(BATCH_DRIVER_MARKER);
+
+/* Finds the closing brace for `class Solution`, ignoring braces in comments/strings. */
 const findSolutionClassRange = (source) => {
     if (typeof source !== "string") return null;
-
     const classMatch = /\bclass\s+Solution\b/.exec(source);
     if (!classMatch) return null;
 
@@ -55,7 +48,6 @@ const findSolutionClassRange = (source) => {
             if (ch === "\n") state = "code";
             continue;
         }
-
         if (state === "blockComment") {
             if (ch === "*" && next === "/") {
                 state = "code";
@@ -63,8 +55,7 @@ const findSolutionClassRange = (source) => {
             }
             continue;
         }
-
-        if (state === "singleQuote" || state === "doubleQuote" || state === "template") {
+        if (["singleQuote", "doubleQuote", "template"].includes(state)) {
             if (escaped) {
                 escaped = false;
                 continue;
@@ -73,11 +64,9 @@ const findSolutionClassRange = (source) => {
                 escaped = true;
                 continue;
             }
-            if (
-                (state === "singleQuote" && ch === "'") ||
+            if ((state === "singleQuote" && ch === "'") ||
                 (state === "doubleQuote" && ch === '"') ||
-                (state === "template" && ch === "`")
-            ) {
+                (state === "template" && ch === "`")) {
                 state = "code";
             }
             continue;
@@ -111,14 +100,12 @@ const findSolutionClassRange = (source) => {
             depth--;
             if (depth === 0) {
                 let end = i + 1;
-                // C++ class declarations end with a semicolon.
                 while (end < source.length && /\s/.test(source[end])) end++;
                 if (source[end] === ";") end++;
                 return { start: classMatch.index, end };
             }
         }
     }
-
     return null;
 };
 
@@ -132,32 +119,19 @@ const extractPreamble = (source, language) => {
             : null;
 
     if (!directivePattern) return { preamble, code: source };
-
-    const code = source
-        .split("\n")
-        .filter((line) => {
-            if (directivePattern.test(line)) {
-                preamble.push(line.trim());
-                return false;
-            }
-            return true;
-        })
-        .join("\n");
-
+    const code = source.split("\n").filter((line) => {
+        if (directivePattern.test(line)) {
+            preamble.push(line.trim());
+            return false;
+        }
+        return true;
+    }).join("\n");
     return { preamble, code };
 };
 
 /*
- * Build an executable program for Run/Submit:
- * - referenceSource must be a complete, working program containing Solution
- *   and its problem-specific main/input/output driver.
- * - userCode is the class-based submission entered by the user.
- * - the reference Solution class is replaced with the user's Solution class;
- *   the driver and its input/output format stay problem-specific.
- *
- * This avoids trying to invent one universal driver for every data structure
- * and method signature. Each problem owns the correct driver in its full
- * reference solution.
+ * A complete reference program is the per-problem driver template. The user's
+ * Solution class replaces the reference class; the program's input driver remains.
  */
 const buildExecutableSource = (userCode, referenceSource, language) => {
     if (typeof userCode !== "string" || !userCode.trim()) {
@@ -167,65 +141,120 @@ const buildExecutableSource = (userCode, referenceSource, language) => {
         throw new Error(`No complete reference executable is configured for ${language}`);
     }
 
-    const normalizedLanguage = normalizeLanguage(language);
-    if (!["c++", "java", "javascript"].includes(normalizedLanguage)) {
+    const kind = normalizeLanguage(language);
+    if (!["c++", "java", "javascript"].includes(kind)) {
         throw new Error(`Class-based execution is not configured for ${language}`);
     }
 
     const referenceRange = findSolutionClassRange(referenceSource);
     const submittedRange = findSolutionClassRange(userCode);
 
-    // Preserve JavaScript's existing full-program flow for function-based
-    // starters. Class-based JavaScript problems can still use the driver
-    // replacement path when both the reference and submission define Solution.
-    if (normalizedLanguage === "javascript" && !referenceRange && !submittedRange) {
-        return userCode;
-    }
+    // Preserve JS full-program submissions for older problems that don't use Solution.
+    if (kind === "javascript" && !referenceRange && !submittedRange) return userCode;
 
     if (!referenceRange) {
-        throw new Error(
-            `The ${language} reference solution must contain a class named Solution and a problem-specific driver`
-        );
+        throw new Error(`The ${language} reference solution must contain class Solution and its driver`);
     }
-
     if (!submittedRange) {
-        throw new Error(
-            `Your ${language} submission must contain a class named Solution. Do not add main(); CodeArena supplies the driver.`
-        );
+        throw new Error(`Your ${language} submission must contain class Solution. Do not add main(); CodeArena supplies the driver.`);
     }
 
-    const submittedParts = extractPreamble(userCode, normalizedLanguage);
-    let submittedClassAndHelpers = submittedParts.code.trim();
-
-    // Java's source filename is Main.java in this driver setup. Solution must
-    // therefore be package-private, not a second public top-level class.
-    if (normalizedLanguage === "java") {
-        submittedClassAndHelpers = submittedClassAndHelpers.replace(
-            /\bpublic\s+class\s+Solution\b/,
-            "class Solution"
-        );
+    const submittedParts = extractPreamble(userCode, kind);
+    let submittedClass = submittedParts.code.trim();
+    if (kind === "java") {
+        submittedClass = submittedClass.replace(/\bpublic\s+class\s+Solution\b/, "class Solution");
     }
-
-    if (!submittedClassAndHelpers) {
-        throw new Error("No Solution class was found in the submitted code");
-    }
+    if (!submittedClass) throw new Error("No Solution class was found in the submitted code");
 
     const prefix = referenceSource.slice(0, referenceRange.start);
     const suffix = referenceSource.slice(referenceRange.end);
-    const existingPrefix = new Set(
-        prefix.split("\n").map((line) => line.trim()).filter(Boolean)
-    );
-    const additionalPreamble = submittedParts.preamble
-        .filter((line) => !existingPrefix.has(line))
-        .join("\n");
+    const prefixLines = new Set(prefix.split("\n").map((line) => line.trim()).filter(Boolean));
+    const extraPreamble = submittedParts.preamble.filter((line) => !prefixLines.has(line)).join("\n");
+    const generatedPrefix = extraPreamble ? `${extraPreamble}\n${prefix}` : prefix;
 
-    // Java imports must stay before class declarations. The C++ directives are
-    // also safely placed at the top of the generated source.
-    const generatedPrefix = additionalPreamble
-        ? `${additionalPreamble}\n${prefix}`
-        : prefix;
+    return `${generatedPrefix}${submittedClass}\n${suffix}`;
+};
 
-    return `${generatedPrefix}${submittedClassAndHelpers}\n${suffix}`;
+const CACHE_TTL_SECONDS = Math.max(60, Number(process.env.JDOODLE_CACHE_TTL_SECONDS) || 6 * 60 * 60);
+const CACHE_MAX_ENTRIES = 500;
+const memoryCache = new Map();
+const inFlight = new Map();
+
+const normalizeOutput = (value) => String(value ?? "")
+    .replace(/\r/g, "")
+    .trim()
+    .replace(/\s+/g, " ");
+
+const makeCacheKey = (submission) => createHash("sha256")
+    .update(JSON.stringify({
+        cacheVersion: 3,
+        clientId: process.env.JDOODLE_CLIENT_ID,
+        source: submission.source_code,
+        stdin: submission.stdin ?? "",
+        language: submission.language,
+        versionIndex: String(submission.versionIndex ?? "0"),
+        compileOnly: false,
+    }))
+    .digest("hex");
+
+const memoryRead = (key) => {
+    const entry = memoryCache.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+        memoryCache.delete(key);
+        return null;
+    }
+    memoryCache.delete(key);
+    memoryCache.set(key, entry);
+    return entry.value;
+};
+
+const memoryWrite = (key, value) => {
+    memoryCache.delete(key);
+    memoryCache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_SECONDS * 1000 });
+    while (memoryCache.size > CACHE_MAX_ENTRIES) {
+        memoryCache.delete(memoryCache.keys().next().value);
+    }
+};
+
+const cacheRead = async (key) => {
+    try {
+        if (redisClient?.isReady) {
+            const saved = await redisClient.get(`${CACHE_PREFIX}${key}`);
+            if (saved) return JSON.parse(saved);
+        }
+    } catch (error) {
+        console.warn("JDoodle Redis cache read skipped:", error.message);
+    }
+    return memoryRead(key);
+};
+
+const cacheWrite = async (key, value) => {
+    // Only cache completed executions. Provider/quota/network failures aren't reusable results.
+    if (!value || value.error || value.httpStatus >= 400 || value.statusCode === 429) return;
+    memoryWrite(key, value);
+    try {
+        if (redisClient?.isReady) {
+            await redisClient.set(`${CACHE_PREFIX}${key}`, JSON.stringify(value), { EX: CACHE_TTL_SECONDS });
+        }
+    } catch (error) {
+        console.warn("JDoodle Redis cache write skipped:", error.message);
+    }
+};
+
+const isServiceFailure = (result) => Boolean(
+    result?.error || Number(result?.httpStatus) >= 400 || Number(result?.statusCode) === 429
+);
+
+const isCompilationFailure = (result) => /(fatal error:|undefined reference|cannot find symbol|compilation failed|could not find or load main class|main method not found|illegal start of expression|';' expected|error:.*(expected|not declared|no matching|cannot|does not name a type))/i.test(String(result?.output ?? ""));
+
+const isRuntimeFailure = (result) => /(segmentation fault|terminate called|exception in thread|uncaught exception|referenceerror|typeerror|syntaxerror|runtimeerror|time limit exceeded|execution timed out|killed by signal)/i.test(String(result?.output ?? ""));
+
+const readProviderError = (error) => {
+    const body = error.response?.data;
+    if (typeof body === "string") return body;
+    if (body) return JSON.stringify(body);
+    return error.message || "JDoodle execution failed";
 };
 
 const executeCode = async (submission) => {
@@ -233,10 +262,14 @@ const executeCode = async (submission) => {
         return { error: "JDoodle credentials are not configured on the backend" };
     }
 
-    try {
-        const response = await axios.post(
-            JDOODLE_URL,
-            {
+    const key = makeCacheKey(submission);
+    const cached = await cacheRead(key);
+    if (cached) return { ...cached, cacheHit: true };
+    if (inFlight.has(key)) return inFlight.get(key);
+
+    const request = (async () => {
+        try {
+            const response = await axios.post(JDOODLE_URL, {
                 clientId: process.env.JDOODLE_CLIENT_ID,
                 clientSecret: process.env.JDOODLE_CLIENT_SECRET,
                 script: submission.source_code,
@@ -244,41 +277,154 @@ const executeCode = async (submission) => {
                 language: submission.language,
                 versionIndex: String(submission.versionIndex ?? "0"),
                 compileOnly: false,
-            },
-            { timeout: 60000 }
-        );
+            }, { timeout: 60000 });
 
-        return response.data;
-    } catch (error) {
-        const providerError = error.response?.data;
-        let readableError;
+            const result = response.data || {};
+            const providerStatus = Number(result.statusCode);
+            if (providerStatus === 429 || /daily limit reached/i.test(String(result.error || ""))) {
+                return {
+                    ...result,
+                    error: "JDoodle daily execution limit reached (HTTP 429). The code was not graded; try after the daily reset.",
+                    httpStatus: 429,
+                };
+            }
 
-        if (typeof providerError === "string") {
-            readableError = providerError;
-        } else if (providerError) {
-            readableError = JSON.stringify(providerError);
-        } else {
-            readableError = error.message || "JDoodle execution failed";
+            await cacheWrite(key, result);
+            return result;
+        } catch (error) {
+            const message = readProviderError(error);
+            const httpStatus = Number(error.response?.status || error.response?.data?.statusCode || 0) || null;
+            const dailyLimit = httpStatus === 429 || /daily limit reached/i.test(message);
+            return {
+                error: dailyLimit
+                    ? "JDoodle daily execution limit reached (HTTP 429). The code was not graded; try after the daily reset."
+                    : error.code === "ECONNABORTED"
+                        ? "JDoodle request timed out"
+                        : message,
+                httpStatus,
+            };
         }
+    })();
 
-        return {
-            error: error.code === "ECONNABORTED"
-                ? "JDoodle request timed out"
-                : readableError,
-            httpStatus: error.response?.status || null,
-        };
+    inFlight.set(key, request);
+    try {
+        return await request;
+    } finally {
+        if (inFlight.get(key) === request) inFlight.delete(key);
     }
 };
 
-/* Execute sequentially to avoid bursts of concurrent API calls. */
+const isWrongAnswer = (submission, result) => {
+    if (!submission?.stopOnWrongAnswer || isServiceFailure(result) || result?.skipped) return false;
+    if (isCompilationFailure(result) || isRuntimeFailure(result)) return true;
+    return normalizeOutput(result?.output) !== normalizeOutput(submission.expected_output);
+};
+
+/*
+ * Individual mode preserves compatibility with old drivers: one JDoodle run per
+ * input. Stop at first wrong answer/compile error for submissions.
+ */
 const submitBatch = async (submissions) => {
     if (!Array.isArray(submissions)) return [];
-
     const results = [];
-    for (const submission of submissions) {
-        results.push(await executeCode(submission));
+
+    for (let i = 0; i < submissions.length; i++) {
+        const result = await executeCode(submissions[i]);
+        results.push(result);
+
+        if (isServiceFailure(result) || isCompilationFailure(result)) {
+            while (results.length < submissions.length) {
+                results.push({ skipped: true, reason: "Stopped after service or compilation failure" });
+            }
+            break;
+        }
+        if (isWrongAnswer(submissions[i], result)) {
+            while (results.length < submissions.length) {
+                results.push({ skipped: true, reason: "Stopped after first failing test case" });
+            }
+            break;
+        }
     }
     return results;
+};
+
+const combineInputs = (testCases) => testCases.map((testCase) =>
+    String(testCase?.input ?? "").replace(/\r\n/g, "\n").replace(/\n$/, "")
+).join("\n") + "\n";
+
+/*
+ * All-at-once execution is opt-in. To use it, each complete reference program
+ * must contain `// CODEARENA_BATCH_MODE: EOF_MARKER`, loop over test instances
+ * until EOF, and print `__CODEARENA_CASE_END__` after each instance's output.
+ * This lets all test cases run in one JDoodle execution without losing case-level
+ * output comparisons. Legacy drivers remain in individual mode automatically.
+ */
+const executeTestCases = async ({ sourceCode, testCases, language, versionIndex, stopOnWrongAnswer = false }) => {
+    if (!Array.isArray(testCases)) return { mode: "individual", results: [], error: "Test cases must be an array" };
+
+    if (hasBatchDriver(sourceCode)) {
+        const combined = await executeCode({
+            source_code: sourceCode,
+            stdin: combineInputs(testCases),
+            language,
+            versionIndex,
+        });
+
+        if (isServiceFailure(combined)) {
+            return { mode: "batch", results: [], serviceFailure: combined };
+        }
+
+        const stdout = String(combined.output ?? "");
+        const pieces = stdout.split(CASE_END_MARKER);
+        const markerCount = pieces.length - 1;
+
+        if (markerCount === testCases.length) {
+            return {
+                mode: "batch",
+                apiCalls: combined.cacheHit ? 0 : 1,
+                results: pieces.slice(0, testCases.length).map((output) => ({
+                    ...combined,
+                    output,
+                    batchExecution: true,
+                })),
+            };
+        }
+
+        // A single compile/runtime error can prevent the driver from emitting all markers.
+        if (isCompilationFailure(combined) || isRuntimeFailure(combined)) {
+            const results = testCases.map((_, index) => {
+                if (index < markerCount) {
+                    return { ...combined, output: pieces[index], batchExecution: true };
+                }
+                return { ...combined, output: stdout, executionFailure: true, batchExecution: true };
+            });
+            return { mode: "batch", apiCalls: combined.cacheHit ? 0 : 1, results };
+        }
+
+        return {
+            mode: "batch",
+            apiCalls: combined.cacheHit ? 0 : 1,
+            results: [],
+            driverError: `Batch driver returned ${markerCount} case markers for ${testCases.length} test cases. Ensure its main/input loop handles every concatenated input until EOF and prints ${CASE_END_MARKER} once per case.`,
+            rawOutput: stdout,
+        };
+    }
+
+    const results = await submitBatch(testCases.map((testCase) => ({
+        source_code: sourceCode,
+        stdin: testCase?.input ?? "",
+        language,
+        versionIndex,
+        expected_output: testCase?.output,
+        stopOnWrongAnswer,
+    })));
+    const serviceFailure = results.find((result) => isServiceFailure(result));
+    return {
+        mode: "individual",
+        apiCalls: results.filter((result) => !result?.skipped && !result?.cacheHit).length,
+        results,
+        ...(serviceFailure ? { serviceFailure } : {}),
+    };
 };
 
 module.exports = {
@@ -286,5 +432,13 @@ module.exports = {
     normalizeLanguage,
     findSolutionClassRange,
     buildExecutableSource,
+    hasBatchDriver,
+    executeCode,
     submitBatch,
+    executeTestCases,
+    normalizeOutput,
+    isServiceFailure,
+    isCompilationFailure,
+    isRuntimeFailure,
+    CASE_END_MARKER,
 };
